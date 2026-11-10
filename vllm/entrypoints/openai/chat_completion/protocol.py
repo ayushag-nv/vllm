@@ -289,6 +289,7 @@ class ChatCompletionRequest(OpenAIBaseModel):
     top_k: int | None = None
     min_p: float | None = None
     repetition_penalty: float | None = None
+    elastic_phase: Literal["full", "sliced", "auto"] | None = None
     watermarking: bool | None = None
     length_penalty: float = 1.0
     stop_token_ids: list[int] | None = []
@@ -717,6 +718,8 @@ class ChatCompletionRequest(OpenAIBaseModel):
     def to_beam_search_params(
         self, max_tokens: int, default_sampling_params: dict
     ) -> BeamSearchParams:
+        if self.elastic_phase is not None:
+            raise ValueError("Beam search is not supported for Elastic models")
         n = self.n if self.n is not None else 1
         if (temperature := self.temperature) is None:
             temperature = default_sampling_params.get(
@@ -782,7 +785,9 @@ class ChatCompletionRequest(OpenAIBaseModel):
         if prompt_logprobs is None and self.echo:
             prompt_logprobs = self.top_logprobs
 
-        extra_args: dict[str, Any] = self.vllm_xargs if self.vllm_xargs else {}
+        extra_args: dict[str, Any] = dict(self.vllm_xargs or {})
+        if self.elastic_phase is not None:
+            extra_args["elastic_phase"] = self.elastic_phase
         if self.kv_transfer_params:
             # Pass in kv_transfer_params via extra_args
             extra_args["kv_transfer_params"] = self.kv_transfer_params
@@ -979,83 +984,77 @@ class ChatCompletionRequest(OpenAIBaseModel):
         if not isinstance(data, dict):
             return data
 
-        # OpenAI treats an empty tools array like an omitted one: "auto" and
-        # "required" have nothing to call and fall back to "none". A named
-        # tool keeps the empty list so the lookup below reports the mismatch.
-        if data.get("tools") == [] and not isinstance(data.get("tool_choice"), dict):
-            data["tools"] = None
-            if data.get("tool_choice") in ("auto", "required"):
-                data["tool_choice"] = "none"
+        tools = data.get("tools")
+        # normalize empty or omitted tools to None
+        if tools == []:
+            tools = None
+            data["tools"] = tools
 
-        # if "tool_choice" is not specified but tools are provided,
-        # default to "auto" tool_choice
-        if "tool_choice" not in data and data.get("tools"):
-            data["tool_choice"] = "auto"
+        tool_choice = data.get("tool_choice")
+        if tools is not None:
+            # omitted tool_choice defaults to auto if tools are provided
+            if tool_choice is None:
+                tool_choice = "auto"
+                data["tool_choice"] = tool_choice
+        else:
+            # omitted tool_choice defaults to none if tools are not provided
+            # auto tool_choice degrades to none if no tool is provided
+            if tool_choice is None or tool_choice == "auto":
+                tool_choice = "none"
+                data["tool_choice"] = tool_choice
 
-        # if "tool_choice" is "none" -- no validation is needed for tools
-        if "tool_choice" in data and data["tool_choice"] == "none":
+        # no validation needed
+        if tool_choice is None or tool_choice == "none":
             return data
 
-        # if "tool_choice" is specified -- validation
-        if "tool_choice" in data and data["tool_choice"] is not None:
-            # ensure that if "tool choice" is specified, tools are present
-            if "tools" not in data or data["tools"] is None:
-                raise VLLMValidationError(
-                    "When using `tool_choice`, `tools` must be set.",
-                    parameter="tool_choice",
-                )
-
-            # make sure that tool choice is either a named tool
-            # OR that it's set to "auto" or "required"
-            if data["tool_choice"] not in ["auto", "required"] and not isinstance(
-                data["tool_choice"], dict
-            ):
-                raise VLLMValidationError(
-                    f"Invalid value for `tool_choice`: {data['tool_choice']}! "
-                    'Only named tools, "none", "auto" or "required" '
-                    "are supported.",
-                    parameter="tool_choice",
-                )
-
-            # ensure that if "tool_choice" is specified as an object,
-            # it matches a valid tool
-            correct_usage_message = (
-                'Correct usage: `{"type": "function",'
-                ' "function": {"name": "my_function"}}`'
+        # any other tool_choice requires tools
+        if tools is None:
+            raise VLLMValidationError(
+                "When using `tool_choice`, `tools` must be set.",
+                parameter="tool_choice",
             )
-            if isinstance(data["tool_choice"], dict):
-                valid_tool = False
-                function = data["tool_choice"].get("function")
-                if not isinstance(function, dict):
-                    raise VLLMValidationError(
-                        f"Invalid value for `function`: `{function}` in "
-                        f"`tool_choice`! {correct_usage_message}",
-                        parameter="tool_choice.function",
-                    )
-                if "name" not in function:
-                    raise VLLMValidationError(
-                        f"Expected field `name` in `function` in "
-                        f"`tool_choice`! {correct_usage_message}",
-                        parameter="tool_choice.function.name",
-                    )
-                function_name = function["name"]
-                if not isinstance(function_name, str) or len(function_name) == 0:
-                    raise VLLMValidationError(
-                        f"Invalid `name` in `function`: `{function_name}`"
-                        f" in `tool_choice`! {correct_usage_message}",
-                        parameter="tool_choice.function.name",
-                    )
-                for tool in data["tools"]:
-                    if tool["function"]["name"] == function_name:
-                        valid_tool = True
-                        break
-                if not valid_tool:
-                    raise VLLMValidationError(
-                        f"The tool `{function_name}` specified in `tool_choice`"
-                        " does not match any of the specified `tools`",
-                        parameter="tool_choice",
-                    )
-        return data
+
+        if tool_choice in ("required", "auto"):
+            return data
+
+        if not isinstance(tool_choice, dict):
+            raise VLLMValidationError(
+                f"Invalid value for `tool_choice`: {tool_choice}! "
+                'Only named tools, "none", "auto" or "required" '
+                "are supported.",
+                parameter="tool_choice",
+            )
+
+        correct_usage_message = (
+            'Correct usage: `{"type": "function", "function": {"name": "my_function"}}`'
+        )
+        function = tool_choice.get("function")
+        if not isinstance(function, dict):
+            raise VLLMValidationError(
+                f"Invalid value for `function`: `{function}` in "
+                f"`tool_choice`! {correct_usage_message}",
+                parameter="tool_choice.function",
+            )
+        if "name" not in function:
+            raise VLLMValidationError(
+                f"Expected field `name` in `function` in "
+                f"`tool_choice`! {correct_usage_message}",
+                parameter="tool_choice.function.name",
+            )
+        function_name = function["name"]
+        if not isinstance(function_name, str) or len(function_name) == 0:
+            raise VLLMValidationError(
+                f"Invalid `name` in `function`: `{function_name}`"
+                f" in `tool_choice`! {correct_usage_message}",
+                parameter="tool_choice.function.name",
+            )
+        if any(tool["function"]["name"] == function_name for tool in tools):
+            return data
+        raise VLLMValidationError(
+            f"The tool `{function_name}` specified in `tool_choice` does not"
+            " match any of the specified `tools`",
+            parameter="tool_choice",
+        )
 
     @model_validator(mode="before")
     @classmethod
